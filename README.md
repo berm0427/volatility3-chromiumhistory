@@ -23,8 +23,6 @@ Microsoft Edge의 InPrivate 환경을 중심으로 실제 메모리 덤프를 �
   브라우저를 모듈 흔적으로 탐지
 - 전체 물리 메모리 카빙과 HistoryDB 비교 기능 제공
 
-Firefox는 Chromium 기반이 아니므로 이 플러그인의 분석 대상이 아닙니다.
-
 ## 설치
 
 릴리스 압축 파일의 `plugins/chromiumhistory.py`를 Volatility 3에서 다음 두 방법
