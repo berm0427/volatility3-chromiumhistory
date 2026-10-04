@@ -1,5 +1,154 @@
 # ChromiumHistory v1.12.0
 
+Windows 메모리 덤프에서 Chromium 계열 브라우저의 일반 방문 기록과
+프로세스 메모리에 남은 URL 흔적을 복구하는 Volatility 3 플러그인입니다.
+Microsoft Edge의 InPrivate 환경을 중심으로 실제 메모리 덤프를 이용해
+검증했으며, 검색어를 미리 알거나 코드에 하드코딩하지 않아도 동작하도록
+설계했습니다.
+
+> 주의: 메모리에서 발견된 URL 문자열 하나만으로 실제 방문이나 시크릿 모드
+> 사용을 확정할 수는 없습니다. 반드시 `Source`, `Mode`, `Persistence`와
+> 구조적 근거를 함께 해석해야 합니다.
+
+## 주요 기능
+
+- Chromium `History` 데이터베이스 구조를 메모리에서 복구하여 일반 방문 기록 표시
+- Chromium 브라우저 프로세스의 VAD에서 URL 및 검색 활동 흔적 탐색
+- 지원되는 Edge 빌드에서 `OffTheRecordProfileImpl`과 렌더러 소유 관계를 이용해
+  InPrivate 컨텍스트를 구조적으로 판별
+- 탭을 닫은 뒤에도 관련 메모리 페이지와 렌더러가 남아 있으면 흔적 복구 가능
+- Google이나 Bing 같은 특정 검색 엔진 및 특정 검색어에 의존하지 않는 범용 탐색
+- 동일 활동의 메모리 복제본을 정규화하여 기본 출력에서 중복 억제
+- Chrome, Edge, Brave, Opera, Vivaldi, Chromium 및 이름이 다른 Chromium 기반
+  브라우저를 모듈 흔적으로 탐지
+- 전체 물리 메모리 카빙과 HistoryDB 비교 기능 제공
+
+Firefox는 Chromium 기반이 아니므로 이 플러그인의 분석 대상이 아닙니다.
+
+## 설치
+
+릴리스 압축 파일의 `plugins/chromiumhistory.py`를 Volatility 3에서 다음 두 방법
+중 하나로 불러올 수 있습니다.
+
+### 방법 1: 플러그인 경로를 명령행에서 지정
+
+```powershell
+python .\vol.py `
+  --plugin-dirs .\ChromiumHistory-v1.12.0\plugins `
+  -f .\memory.raw `
+  chromiumhistory.ChromiumHistory
+```
+
+### 방법 2: Volatility 3의 Windows 플러그인 폴더에 복사
+
+`plugins/chromiumhistory.py`를 다음 위치에 복사합니다.
+
+```text
+volatility3/framework/plugins/windows/chromiumhistory.py
+```
+
+그다음 아래처럼 실행합니다.
+
+```powershell
+python .\vol.py -f .\memory.raw windows.chromiumhistory.ChromiumHistory
+```
+
+## 기본 사용법
+
+가장 먼저 실행할 명령은 다음과 같습니다.
+
+```powershell
+python .\vol.py -f 'C:\경로\memory.raw' windows.chromiumhistory.ChromiumHistory
+```
+
+기본 화면은 사람이 확인하기 쉽도록 핵심 9개 열만 표시합니다.
+
+| 열 | 의미 |
+|---|---|
+| `Source` | HistoryDB, 프로세스 메모리 등 증거가 발견된 위치 |
+| `PID` | 관련 프로세스 ID. 물리 메모리 단독 흔적은 `-1` |
+| `Process` | 관련 브라우저 프로세스 이름 |
+| `Mode` | `Regular`, `InPrivate`, `Unknown` 등의 브라우징 컨텍스트 |
+| `Activity` | 복원된 검색어, 페이지 제목 또는 대표 URL |
+| `Host` | URL 호스트 이름 |
+| `Visits` | HistoryDB에 남은 방문 횟수 |
+| `LastVisitKST` | 복구 가능한 경우의 마지막 방문 시각(한국 표준시) |
+| `Persistence` | 일반 HistoryDB와의 비교 및 영속성 판정 |
+
+CSV 분석이나 모든 포렌식 필드가 필요하면 `--full-output`을 사용합니다.
+
+```powershell
+python .\vol.py -r csv -f .\memory.raw `
+  windows.chromiumhistory.ChromiumHistory --full-output |
+  Out-File .\chromium-full.csv -Encoding utf8
+```
+
+## 목적별 실행 예시
+
+일반 HistoryDB 기록만 확인:
+
+```powershell
+python .\vol.py -f .\memory.raw `
+  windows.chromiumhistory.ChromiumHistory --history-only
+```
+
+HistoryDB에 없는 프로세스 메모리 흔적만 확인:
+
+```powershell
+python .\vol.py -f .\memory.raw `
+  windows.chromiumhistory.ChromiumHistory --memory-only
+```
+
+닫힌 탭을 포함하여 프로세스와 물리 메모리에 남은 URL 흔적을 폭넓게 탐색:
+
+```powershell
+python .\vol.py -f .\memory.raw `
+  windows.chromiumhistory.ChromiumHistory --recover-closed
+```
+
+HistoryDB와 비교하여 영속 기록 여부까지 판정:
+
+```powershell
+python .\vol.py -f .\memory.raw `
+  windows.chromiumhistory.ChromiumHistory `
+  --compare-history --physical-only --physical-browser-context
+```
+
+증거성이 약한 문자열까지 모두 검토해야 할 때만 `--raw-url-strings`를 사용하세요.
+출력량과 오탐 후보가 크게 늘어날 수 있습니다.
+
+## 시크릿/InPrivate 결과 해석
+
+- `HistoryDB + Regular`: 일반 브라우징 기록으로 해석할 수 있는 영속 레코드입니다.
+- 구조적으로 확인된 `InPrivate`: 지원되는 브라우저 빌드에서 해당 렌더러가
+  Off-The-Record 프로필에 속한다는 메모리 구조 근거가 확인된 경우입니다.
+- `MemoryOnly`: HistoryDB에서 같은 URL을 찾지 못했다는 뜻일 뿐, 이것만으로
+  시크릿 방문을 확정하지는 않습니다.
+- `PhysicalURLString`: 물리 메모리에서 URL 모양의 문자열이 발견됐다는 뜻입니다.
+  원래 프로세스나 실제 최상위 방문 여부는 단독으로 확정할 수 없습니다.
+- 결과가 없다고 해서 방문이 없었다는 뜻은 아닙니다. 탭 또는 프로세스 종료 후
+  메모리 페이지가 해제·덮어쓰기 되었거나 덤프에 포함되지 않았을 수 있습니다.
+
+브라우저 업데이트로 내부 구조가 달라질 수 있으므로, 정확한 InPrivate 구조 판별은
+지원되는 빌드에서 가장 신뢰할 수 있습니다. 알 수 없는 빌드는 임의로
+`InPrivate`라고 추정하지 않고 `Unknown`으로 남깁니다.
+
+## 테스트
+
+```powershell
+python .\tests\test_chromiumhistory.py
+python .\tests\test_mock_integration.py
+```
+
+현재 버전은 단위 및 모의 통합 테스트 36개를 통과했으며, 35.9GB Windows 메모리
+덤프에서 일반 HistoryDB 레코드와 Edge InPrivate 활동을 검증했습니다. 저장소의
+`media/ChromiumHistory-v1.12.0-validation.mp4`에서 실제 실행 화면을 확인할 수
+있습니다.
+
+---
+
+아래는 버전별 구현 및 검증 세부 기록입니다.
+
 ## Version 1.12.0: readable default output
 
 The default terminal view now contains nine focused columns: `Source`, `PID`,
