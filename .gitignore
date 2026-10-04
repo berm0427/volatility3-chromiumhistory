@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.raw
+*.dmp
+*.mem
+*.vmem
+*.lime
+*.csv
+*.log
+.pytest_cache/
+.venv/
+venv/
