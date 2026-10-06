@@ -223,6 +223,14 @@ CHROMIUM_MODULE_MARKERS = {
     "opera_browser.dll",
     "vivaldi.dll",
 }
+BROWSER_MODULE_PREFERENCES = {
+    "chrome.exe": ("chrome.dll",),
+    "chromium.exe": ("chrome.dll",),
+    "brave.exe": ("chrome.dll",),
+    "msedge.exe": ("msedge.dll",),
+    "opera.exe": ("opera_browser.dll", "chrome.dll"),
+    "vivaldi.exe": ("vivaldi.dll", "chrome.dll"),
+}
 MEMORY_NEEDLES = [
     needle
     for scheme in URL_SCHEMES
@@ -677,6 +685,20 @@ def persistence_assessment(
     return "NotInRecoveredHistory"
 
 
+def recovered_activity_identity(record: RecoveredURL) -> str:
+    """Builds a cross-source identity for default-output deduplication."""
+
+    if record.canonical_activity:
+        return record.canonical_activity
+    engine, query = search_details(record.url)
+    if query:
+        return "search:{}:{}".format(
+            (engine or urlparse(record.url).netloc).casefold(),
+            query.casefold(),
+        )
+    return normalize_url(record.url)
+
+
 def navigation_score(url: str, source: str = "") -> Tuple[int, str]:
     """Scores URL-shaped remnants without claiming they prove a visit."""
     try:
@@ -789,8 +811,11 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                 default=0, optional=True),
             requirements.StringRequirement(
                 name="browser_module",
-                description="Browser code module containing private-mode flag",
-                default="msedge.dll", optional=True),
+                description=(
+                    "Browser code module containing the private-mode flag; "
+                    "auto selects a module from each process family"
+                ),
+                default="auto", optional=True),
             requirements.StringRequirement(
                 name="process_names",
                 description=(
@@ -1115,7 +1140,7 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
             return 0, "Browser module PE header page not resident"
 
     def _renderer_context_modes(
-        self, processes: Sequence[object], flag_rva: int
+        self, processes: Sequence[object], flag_rva: int, module_name: str
     ) -> Dict[int, Tuple[str, str]]:
         """Maps renderer client IDs through RenderProcessHostImpl objects.
 
@@ -1129,7 +1154,7 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
         if not layout:
             return {}
         kernel = self.context.modules[self.config["kernel"]]
-        module_name = self.config.get("browser_module", "msedge.dll").casefold()
+        module_name = module_name.casefold()
         for proc in processes:
             try:
                 args = cmdline.CmdLine.get_cmdline(
@@ -1259,28 +1284,64 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
         if not match:
             return "Unknown", "No renderer client ID"
         client_id = int(match.group(1))
+        process_name = utility.array_to_string(proc.ImageFileName)
+        module_name, _module_base = ChromiumHistory._find_browser_module(
+            self,
+            proc, process_name
+        )
         return modes.get(
-            client_id,
+            (module_name, client_id),
             ("Unknown", f"Renderer client {client_id} not recovered in browser host")
         )
+
+    def _browser_module_candidates(self, process_name: str) -> Tuple[str, ...]:
+        configured = str(self.config.get("browser_module", "auto")).strip().casefold()
+        if configured and configured != "auto":
+            return (configured,)
+        preferred = BROWSER_MODULE_PREFERENCES.get(process_name.casefold(), ())
+        remaining = tuple(
+            name for name in sorted(CHROMIUM_MODULE_MARKERS)
+            if name not in preferred and name != "chrome_elf.dll"
+        )
+        return tuple(preferred) + remaining
+
+    def _find_browser_module(
+        self, proc: object, process_name: str
+    ) -> Tuple[str, int]:
+        """Returns the browser-family code module and its mapped base."""
+
+        candidates = ChromiumHistory._browser_module_candidates(
+            self, process_name
+        )
+        mapped: Dict[str, int] = {}
+        try:
+            for vad in proc.get_vad_root().traverse():
+                try:
+                    mapped_name = vad.get_file_name()
+                    if not mapped_name:
+                        continue
+                    leaf = str(mapped_name).replace("/", "\\").rsplit("\\", 1)[-1]
+                    leaf = leaf.casefold()
+                    if leaf in candidates and leaf not in mapped:
+                        mapped[leaf] = int(vad.get_start())
+                except (AttributeError, exceptions.InvalidAddressException):
+                    continue
+        except (AttributeError, exceptions.InvalidAddressException):
+            return candidates[0] if candidates else "", 0
+        for name in candidates:
+            if name in mapped:
+                return name, mapped[name]
+        return candidates[0] if candidates else "", 0
 
     def _private_mode(self, proc: object) -> Tuple[str, str]:
         """Reads the exact-build renderer private-mode flag when configured."""
 
         flag_rva = int(self.config.get("private_flag_rva", 0))
-        module_name = self.config.get("browser_module", "msedge.dll").casefold()
-        module_base = 0
+        process_name = utility.array_to_string(proc.ImageFileName)
+        module_name, module_base = ChromiumHistory._find_browser_module(
+            self, proc, process_name
+        )
         try:
-            for vad in proc.get_vad_root().traverse():
-                try:
-                    mapped_name = vad.get_file_name()
-                    if mapped_name and str(mapped_name).casefold().endswith(
-                        "\\" + module_name
-                    ):
-                        module_base = int(vad.get_start())
-                        break
-                except (AttributeError, exceptions.InvalidAddressException):
-                    continue
             if not module_base:
                 fallback = self._renderer_host_mode(proc)
                 if fallback[0] != "Unknown":
@@ -1297,14 +1358,11 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                 # browser processes in one capture use the same image build,
                 # so reuse a build identity recovered from a sibling process.
                 if not flag_rva:
-                    flag_rva = int(getattr(
-                        self, "_session_private_flag_rva", 0
-                    ))
-                    if flag_rva:
-                        resolution = getattr(
-                            self, "_session_private_flag_resolution",
-                            "Session browser build private flag RVA",
-                        )
+                    session_flags = getattr(self, "_session_private_flags", {})
+                    session_value = session_flags.get(module_name)
+                    if session_value:
+                        flag_rva = int(session_value[0])
+                        resolution = str(session_value[1])
                 if not flag_rva:
                     fallback = self._renderer_host_mode(proc)
                     if fallback[0] != "Unknown":
@@ -1405,30 +1463,22 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
         structured = self.config.get("navigation_structures", False)
         processes = list(self._selected_processes())
 
-        # Resolve the browser build once from any process whose module header
-        # survived acquisition.  Renderer headers are often absent although
-        # their flag/data pages are still readable.
+        # Resolve each browser family's build independently.  An Edge RVA must
+        # never be reused for Chrome (or another Chromium browser) merely
+        # because both families coexist in the same capture.
         if not int(self.config.get("private_flag_rva", 0)):
-            self._session_private_flag_rva = 0
-            self._session_private_flag_resolution = ""
-            module_name = self.config.get(
-                "browser_module", "msedge.dll"
-            ).casefold()
+            self._session_private_flags: Dict[str, Tuple[int, str]] = {}
             for candidate in processes:
                 try:
-                    candidate_base = 0
-                    for vad in candidate.get_vad_root().traverse():
-                        try:
-                            mapped_name = vad.get_file_name()
-                            if (mapped_name and
-                                    str(mapped_name).casefold().endswith(
-                                        "\\" + module_name)):
-                                candidate_base = int(vad.get_start())
-                                break
-                        except (AttributeError,
-                                exceptions.InvalidAddressException):
-                            continue
+                    process_name = utility.array_to_string(
+                        candidate.ImageFileName
+                    )
+                    module_name, candidate_base = ChromiumHistory._find_browser_module(
+                        self, candidate, process_name
+                    )
                     if not candidate_base:
+                        continue
+                    if module_name in self._session_private_flags:
                         continue
                     candidate_layer = self.context.layers[
                         candidate.add_process_layer()
@@ -1439,22 +1489,39 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                         )
                     )
                     if resolved_rva:
-                        self._session_private_flag_rva = resolved_rva
-                        self._session_private_flag_resolution = (
-                            resolved_evidence + "; reused across browser session"
+                        self._session_private_flags[module_name] = (
+                            resolved_rva,
+                            resolved_evidence
+                            + f"; reused across {module_name} session",
                         )
-                        break
                 except exceptions.InvalidAddressException:
                     continue
 
-        effective_flag_rva = int(self.config.get("private_flag_rva", 0)) or int(
-            getattr(self, "_session_private_flag_rva", 0)
-        )
         context_mode_reader = getattr(self, "_renderer_context_modes", None)
-        self._renderer_client_modes = (
-            context_mode_reader(processes, effective_flag_rva)
-            if callable(context_mode_reader) else {}
-        )
+        self._renderer_client_modes: Dict[
+            Tuple[str, int], Tuple[str, str]
+        ] = {}
+        explicit_rva = int(self.config.get("private_flag_rva", 0))
+        session_flags = getattr(self, "_session_private_flags", {})
+        if callable(context_mode_reader):
+            module_groups: Dict[str, List[object]] = {}
+            for candidate in processes:
+                process_name = utility.array_to_string(candidate.ImageFileName)
+                module_name, _base = ChromiumHistory._find_browser_module(
+                    self, candidate, process_name
+                )
+                module_groups.setdefault(module_name, []).append(candidate)
+            for module_name, grouped_processes in module_groups.items():
+                effective_rva = explicit_rva
+                if not effective_rva and module_name in session_flags:
+                    effective_rva = int(session_flags[module_name][0])
+                if not effective_rva:
+                    continue
+                recovered = context_mode_reader(
+                    grouped_processes, effective_rva, module_name
+                )
+                for client_id, value in recovered.items():
+                    self._renderer_client_modes[(module_name, client_id)] = value
 
         for proc in processes:
             pid = int(proc.UniqueProcessId)
@@ -1576,9 +1643,7 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                     # represents the activity once across identity-proven
                     # InPrivate renderers; raw mode retains per-PID copies.
                     identity_pid = (
-                        0 if browsing_mode == "InPrivate"
-                        and not self.config.get("raw_url_strings", False)
-                        else pid
+                        pid if self.config.get("raw_url_strings", False) else 0
                     )
                     identity = (identity_pid, normalized)
                     if identity in seen:
@@ -1806,6 +1871,8 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
 
     def _generator(self):
         history: Dict[str, RecoveredURL] = {}
+        reported_activities: Set[str] = set()
+        raw_output = self.config.get("raw_url_strings", False)
         targeted_search = bool(self.config.get("search_terms", "").strip())
         recover_searches = self.config.get("recover_searches", False)
         recover_closed = self.config.get("recover_closed", False)
@@ -1819,8 +1886,27 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
         if history_scanned:
             for record in self._history_records():
                 history.setdefault(normalize_url(record.url), record)
+        search_terms = [
+            item.strip() for item in self.config.get("search_terms", "").split(",")
+            if item.strip()
+        ]
+        url_filters = [
+            item.strip().casefold()
+            for item in self.config.get("url_filter", "").split(",")
+            if item.strip()
+        ]
         if not self.config.get("memory_only", False):
             for record in history.values():
+                if search_terms and not matches_search_terms(
+                    record.url, search_terms
+                ):
+                    continue
+                if url_filters and not any(
+                    item in record.url.casefold() for item in url_filters
+                ):
+                    continue
+                if not raw_output:
+                    reported_activities.add(recovered_activity_identity(record))
                 yield self._output_row(record)
         if self.config.get("history_only", False):
             return
@@ -1828,6 +1914,11 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
         if not self.config.get("physical_only", False):
             for record in self._memory_records(set(history), history_scanned):
                 process_count += 1
+                identity = recovered_activity_identity(record)
+                if not raw_output and identity in reported_activities:
+                    continue
+                if not raw_output:
+                    reported_activities.add(identity)
                 yield self._output_row(record)
         use_fallback = (
             self.config.get("physical_fallback", True) and process_count == 0
@@ -1844,6 +1935,11 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
         ))
         if use_fallback or self.config.get("scan_physical", False) or targeted_physical:
             for record in self._physical_records(set(history), history_scanned):
+                identity = recovered_activity_identity(record)
+                if not raw_output and identity in reported_activities:
+                    continue
+                if not raw_output:
+                    reported_activities.add(identity)
                 yield self._output_row(record)
 
     def run(self):

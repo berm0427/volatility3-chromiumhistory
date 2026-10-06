@@ -404,6 +404,37 @@ class ChromiumHistoryTests(unittest.TestCase):
         self.assertEqual(classify(0x2000, {0x3000}, {0x2000}), "Regular")
         self.assertEqual(classify(0x4000, {0x3000}, {0x2000}), "Unknown")
 
+    def test_browser_module_auto_selection_is_process_specific(self):
+        dummy = type("Dummy", (), {"config": {"browser_module": "auto"}})()
+        choose = chromiumhistory.ChromiumHistory._browser_module_candidates
+        self.assertEqual(choose(dummy, "chrome.exe")[0], "chrome.dll")
+        self.assertEqual(choose(dummy, "msedge.exe")[0], "msedge.dll")
+        self.assertEqual(choose(dummy, "opera.exe")[0], "opera_browser.dll")
+        self.assertEqual(choose(dummy, "vivaldi.exe")[0], "vivaldi.dll")
+
+    def test_explicit_browser_module_overrides_auto_selection(self):
+        dummy = type(
+            "Dummy", (), {"config": {"browser_module": "custom.dll"}}
+        )()
+        choose = chromiumhistory.ChromiumHistory._browser_module_candidates
+        self.assertEqual(choose(dummy, "chrome.exe"), ("custom.dll",))
+
+    def test_cross_source_search_identity_ignores_url_variants(self):
+        first = chromiumhistory.RecoveredURL(
+            source="ProcessURLString", confidence="test", pid=1,
+            process="chrome.exe", offset=1,
+            url="https://www.google.com/search?q=Same+Activity&sei=one",
+        )
+        second = chromiumhistory.RecoveredURL(
+            source="PhysicalURLString", confidence="test", pid=-1,
+            process="PhysicalMemory", offset=2,
+            url="https://www.google.com/search?q=Same%20Activity&sei=two",
+        )
+        self.assertEqual(
+            chromiumhistory.recovered_activity_identity(first),
+            chromiumhistory.recovered_activity_identity(second),
+        )
+
     def test_compact_row_prioritizes_search_activity(self):
         record = chromiumhistory.RecoveredURL(
             source="MemoryOnly",

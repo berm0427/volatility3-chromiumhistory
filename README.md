@@ -1,4 +1,4 @@
-# ChromiumHistory v1.12.0
+# ChromiumHistory v1.13.0
 
 Windows 메모리 덤프에서 Chromium 계열 브라우저의 일반 방문 기록과
 프로세스 메모리에 남은 URL 흔적을 복구하는 Volatility 3 플러그인입니다.
@@ -32,7 +32,7 @@ Microsoft Edge의 InPrivate 환경을 중심으로 실제 메모리 덤프를 �
 
 ```powershell
 python .\vol.py `
-  --plugin-dirs .\ChromiumHistory-v1.12.0\plugins `
+  --plugin-dirs .\ChromiumHistory-v1.13.0\plugins `
   -f .\memory.raw `
   chromiumhistory.ChromiumHistory
 ```
@@ -138,7 +138,7 @@ python .\tests\test_chromiumhistory.py
 python .\tests\test_mock_integration.py
 ```
 
-현재 버전은 단위 및 모의 통합 테스트 36개를 통과했으며, 35.9GB Windows 메모리
+현재 버전은 단위 및 모의 통합 테스트 39개를 통과했으며, 35.9GB Windows 메모리
 덤프에서 일반 HistoryDB 레코드와 Edge InPrivate 활동을 검증했습니다. 저장소의
 `media/ChromiumHistory-v1.12.0-validation.mp4`에서 실제 실행 화면을 확인할 수
 있습니다.
@@ -146,6 +146,33 @@ python .\tests\test_mock_integration.py
 ---
 
 아래는 버전별 구현 및 검증 세부 기록입니다.
+
+## Version 1.13.0: browser-family isolation and activity deduplication
+
+브라우저 프로세스 이름과 매핑 모듈을 이용해 `chrome.dll`, `msedge.dll`,
+`opera_browser.dll`, `vivaldi.dll` 등을 자동 선택합니다. 여러 Chromium 브라우저가
+동시에 존재해도 한 브라우저에서 해석한 private-mode RVA를 다른 브라우저 계열에
+재사용하지 않습니다. `--browser-module`에 모듈 이름을 직접 지정하는 기존 방식도
+유지됩니다.
+
+기본 출력에서는 같은 정규화 활동이 여러 renderer PID와 물리 메모리에 복제되어
+있어도 한 번만 표시합니다. 원본 사본과 오프셋을 모두 조사해야 할 때는
+`--raw-url-strings`를 사용하면 됩니다.
+
+Chrome 154.0.8037.98 실덤프 검증에서 다음 네 상태의 검색 활동을 모두 복구했습니다.
+
+- 열린 일반 탭
+- 닫힌 일반 탭
+- 열린 시크릿 탭
+- 닫힌 시크릿 탭
+
+각 고유 활동은 기본 출력에서 한 행으로 정리됐습니다. 이 Chrome 빌드의 PDB 기반
+private-mode 구조 메타데이터는 아직 등록되어 있지 않으므로 모드는 임의 추정하지
+않고 `Unknown`으로 표시하며, 실제 PE TimeDateStamp와 SizeOfImage를 근거로 출력합니다.
+
+`NotInRecoveredHistory`는 디스크의 실제 History DB에 URL이 없다는 뜻이 아니라,
+현재 메모리 이미지에서 복구된 SQLite History 레코드 집합에서 같은 URL을 찾지
+못했다는 뜻입니다. 최신 DB 페이지가 획득 시점에 메모리에 상주하지 않을 수 있습니다.
 
 ## Version 1.12.0: readable default output
 
@@ -378,7 +405,7 @@ modifying the Volatility installation:
 
 ```powershell
 python .\vol.py `
-  --plugin-dirs .\ChromiumHistory-v1.12.0\plugins `
+  --plugin-dirs .\ChromiumHistory-v1.13.0\plugins `
   -f .\memory.raw `
   chromiumhistory.ChromiumHistory
 ```
@@ -391,7 +418,7 @@ Alternatively, copy `plugins/chromiumhistory.py` into
 
 ```powershell
 python .\vol.py `
-  --plugin-dirs .\ChromiumHistory-v1.12.0\plugins `
+  --plugin-dirs .\ChromiumHistory-v1.13.0\plugins `
   -f .\memory.raw `
   chromiumhistory.ChromiumHistory
 ```
@@ -401,7 +428,7 @@ rows:
 
 ```powershell
 python .\vol.py `
-  --plugin-dirs .\ChromiumHistory-v1.12.0\plugins `
+  --plugin-dirs .\ChromiumHistory-v1.13.0\plugins `
   -f .\memory.raw `
   chromiumhistory.ChromiumHistory `
   --memory-only
