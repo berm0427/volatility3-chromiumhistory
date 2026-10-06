@@ -1617,12 +1617,6 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                     artifact_class, canonical_activity = classify_artifact(
                         url, source, role
                     )
-                    if not self.config.get("raw_url_strings", False):
-                        if (getattr(self, "_renderer_client_modes", {}) and
-                                browsing_mode != "InPrivate"):
-                            continue
-                        if browsing_mode == "Regular":
-                            continue
                     if (not self.config.get("raw_url_strings", False)
                             and artifact_class in (
                                 "TemplateOrInternal", "BackgroundOrEmbedded"

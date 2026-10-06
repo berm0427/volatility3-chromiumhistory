@@ -106,6 +106,35 @@ class ChromiumMockIntegrationTests(unittest.TestCase):
             {"https://private.example/one", wide_text},
         )
 
+    def test_regular_process_url_is_not_discarded(self):
+        base = 0x4000
+        url = b"https://regular.example/visited\x00"
+        data = bytearray(b"\x00" * 0x1000)
+        data[0x180 : 0x180 + len(url)] = url
+        layer = FakeLayer(base, bytes(data), [(base + 0x180, b"https://")])
+        proc = FakeProc(FakeVad(base, base + len(data) - 1))
+        fake = types.SimpleNamespace(
+            config={
+                "max_url_length": 512,
+                "max_results": 100,
+                "include_unattributed": True,
+            },
+            context=types.SimpleNamespace(layers={"edge_layer": layer}),
+            _progress_callback=None,
+            _selected_processes=lambda: [proc],
+            _vad_sections=MODULE.ChromiumHistory._vad_sections,
+            _containing_section=MODULE.ChromiumHistory._containing_section,
+            _private_mode=lambda _proc: (
+                "Regular", "Mock regular renderer context"
+            ),
+        )
+        with mock.patch.object(MODULE.utility, "array_to_string", lambda x: str(x)):
+            records = list(MODULE.ChromiumHistory._memory_records(fake, set()))
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].url, "https://regular.example/visited")
+        self.assertEqual(records[0].browsing_mode, "Regular")
+
     def test_closed_session_url_flows_through_physical_fallback(self):
         url = b"https://www.bing.com/search?q=pear\x00"
         data = bytearray(b"\x00" * 0x1000)
