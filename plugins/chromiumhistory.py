@@ -4,6 +4,10 @@ Chromium browsers do not persist private-mode visits to their History database.
 Accordingly, this plugin correlates recovered History rows with HTTP(S) URL
 strings carved directly from browser process VADs. URLs seen only in
 process memory are reported as MemoryOnly (possible Incognito), not as proof.
+
+This implementation originated from the 2024 forsick/Windows feat/v2 team
+project and was subsequently extensively rewritten and expanded.  See the
+repository's NOTICE.md for provenance and rights information.
 """
 
 import dataclasses
@@ -19,7 +23,7 @@ from volatility3.framework.configuration import requirements
 from volatility3.framework.layers import scanners
 from volatility3.framework.objects import utility
 from volatility3.framework.renderers import format_hints
-from volatility3.plugins.windows import cmdline, pslist, psscan
+from volatility3.plugins.windows import cmdline, filescan, pslist, psscan
 
 
 vollog = logging.getLogger(__name__)
@@ -199,15 +203,71 @@ KNOWN_CHROMIUM_PROCESSES = {
 # unknown build is never guessed: it remains Unknown until its PDB-derived RVA
 # is added here or supplied explicitly with --private-flag-rva.
 PRIVATE_FLAG_BUILDS = {
+    # Google Chrome 154.0.8037.98 (chrome.dll).  The RVA is the PDB-resolved
+    # `anonymous namespace'::g_is_incognito_process renderer flag.
+    (0x6ABD899F, 0x12320000): (
+        0x117AAEF8, "Google Chrome 154.0.8037.98"
+    ),
+    # Brave 1.96.61 / Chromium 154 (chrome.dll), from Brave's official PDB.
+    (0x6ABF8DA1, 0x13AE2000): (
+        0x12F00E20, "Brave 1.96.61 (Chromium 154)"
+    ),
     (0x6ABACB8E, 0x14F08000): (
         0x13FB3B78, "Microsoft Edge 154.0.4258.48"
+    ),
+    (0x6ABD9861, 0x14F3B000): (
+        0x13E6B6CC, "Microsoft Edge 154.0.4258.53"
     ),
 }
 # Exact-build object metadata used when the renderer's flag page is not
 # resident.  The key is the PDB-derived private-flag RVA selected above.
 PRIVATE_CONTEXT_OBJECT_BUILDS = {
-    0x13FB3B78: {
+    0x117AAEF8: {
+        # Values below are RVAs, not preferred-image virtual addresses.
+        # Chrome's PDB reports several RenderProcessHostImpl vftables because
+        # the class has multiple polymorphic bases. Candidate objects still
+        # have to pass the client-id and BrowserContext identity checks.
+        "otr_profile_vftable_rva": 0xF8FE0C8,
+        "otr_original_profile_offset": 0xD0,
+        "render_host_vftable_rvas": (
+            0xF948948, 0xF915C68, 0xF8B4A48, 0xF947DF8,
+            0xF8D7B20, 0xF5D5F00, 0xF955588, 0xF948888,
+        ),
+        "render_host_client_id_offset": 0x1B0,
+        "render_host_browser_context_offset": 0x1B8,
+        "navigation_controller_vftable_rva": 0xF5D5340,
+        "navigation_entry_vftable_rva": 0xF5D54D0,
+        "navigation_controller_context_offset": 0x10,
+        "navigation_controller_entries_offset": 0x18,
+        "navigation_entry_virtual_url_offset": 0x28,
+        "navigation_entry_frame_tree_offset": 0x18,
+        "tree_node_frame_entry_offset": 0x08,
+        "frame_navigation_url_offset": 0x60,
+    },
+    0x12F00E20: {
+        "otr_profile_vftable_rva": 0x10C8BB48,
+        "otr_original_profile_offset": 0xD0,
+        "render_host_vftable_rvas": (
+            0x10D15450, 0x109531D8, 0x10C70CB8, 0x10D14890,
+            0x10C96748, 0x109531D0, 0x10D221A0, 0x10D15390,
+        ),
+        "render_host_client_id_offset": 0x1B0,
+        "render_host_browser_context_offset": 0x1B8,
+        "navigation_controller_vftable_rva": 0x10952600,
+        "navigation_entry_vftable_rva": 0x10952790,
+        "navigation_controller_context_offset": 0x10,
+        "navigation_controller_entries_offset": 0x18,
+        # Brave adds browser-specific fields before its committed URL GURL.
+        "navigation_entry_virtual_url_offset": 0x1D0,
+        "navigation_entry_frame_tree_offset": 0x18,
+        "tree_node_frame_entry_offset": 0x08,
+        "frame_navigation_url_offset": 0x60,
+    },
+    # Edge 154.0.4258.53: all three values below were derived from the
+    # matching msedge.dll PDB and validated against live renderer client IDs.
+    0x13E6B6CC: {
         "otr_profile_vftable_rva": 0x112A73A8,
+        "otr_original_profile_offset": 0xF8,
         # Primary complete-object vftable.  Other PDB vftables refer to base
         # subobjects and must not be parsed with complete-object offsets.
         "render_host_vftable_rvas": (0x112B3760,),
@@ -266,6 +326,12 @@ NETWORK_CONTEXT_MARKERS = (
     b"user-agent", b"referer", b"authorization", b"cookie",
     b"sec-fetch-", b"content-type", b"origin:", b"accept-language",
 )
+SESSION_FILE_RE = re.compile(
+    r"(?:^|\\)(?P<profile>[^\\]+)\\Sessions\\"
+    r"(?P<kind>Tabs|Session)_(?P<stamp>\d+)$",
+    re.IGNORECASE,
+)
+SESSION_URL_RE = re.compile(rb"https?://[^\x00-\x20\"<>]{3,4096}")
 NON_BROWSER_TEXT_MARKERS = (
     b"self.assert", b"unittest.", b"def test_", b"<toast", b"</toast",
     b"<text>", b"</text>", b"<binding", b"</binding>", b"<actions",
@@ -308,6 +374,38 @@ class SerializedNavigation:
     title: str
     index: int
     transition_type: int
+
+
+def chromium_session_time(value: str) -> str:
+    """Converts a Chromium session filename timestamp to ISO-8601 UTC."""
+
+    try:
+        timestamp = int(value)
+        result = datetime.datetime(1601, 1, 1, tzinfo=datetime.timezone.utc)
+        result += datetime.timedelta(microseconds=timestamp)
+    except (ValueError, OverflowError):
+        return ""
+    return result.isoformat()
+
+
+def extract_session_urls(data: bytes, max_url_length: int = 4096) -> Iterator[Tuple[int, str]]:
+    """Yields conservative HTTP(S) URL strings from cached SNSS data."""
+
+    seen: Set[str] = set()
+    for match in SESSION_URL_RE.finditer(data):
+        raw = match.group(0)[:max_url_length]
+        try:
+            url = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            continue
+        url = extract_memory_url(raw + b"\x00", False, max_url_length)
+        if not is_recoverable_url(url):
+            continue
+        key = normalize_url(url)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield match.start(), url
 
 
 def _pickle_aligned(position: int, payload_start: int) -> int:
@@ -456,6 +554,44 @@ def extract_memory_url(data: bytes, wide: bool, max_length: int = 4096) -> str:
     return value.rstrip(TRAILING_PUNCTUATION)
 
 
+def decode_libcpp_string(
+    layer: object, address: int, max_length: int = 4096
+) -> str:
+    """Reads Chromium's 64-bit libc++ ``std::string`` representation."""
+
+    header = layer.read(address, 24, pad=False)
+    candidates = []
+    if header[0] & 1:
+        candidates.append((struct.unpack_from("<Q", header, 16)[0],
+                           struct.unpack_from("<Q", header, 8)[0], b""))
+    else:
+        candidates.append((0, header[0] >> 1,
+                           header[1:1 + (header[0] >> 1)]))
+
+    # Chromium 154 also uses libc++'s alternate string layout in which a
+    # long string is {pointer, size, capacity} and a short string keeps its
+    # length in the final byte.  Pointer/length plausibility plus strict UTF-8
+    # decoding prevents treating arbitrary objects as strings.
+    pointer, length = struct.unpack_from("<QQ", header, 0)
+    if 0x10000 <= pointer < 0x800000000000:
+        candidates.append((pointer, length, b""))
+    for short_length in (header[23] >> 1, header[23] & 0x7F):
+        if short_length:
+            candidates.append((0, short_length, header[:short_length]))
+
+    for data_pointer, length, inline in candidates:
+        if not (0 < length <= max_length):
+            continue
+        try:
+            raw = inline if inline else layer.read(
+                data_pointer, int(length), pad=False
+            )
+            return raw.decode("utf-8", errors="strict")
+        except (UnicodeDecodeError, exceptions.InvalidAddressException):
+            continue
+    return ""
+
+
 def is_recoverable_url(url: str) -> bool:
     """Rejects browser match-patterns and malformed web URLs."""
     try:
@@ -497,11 +633,51 @@ def search_details(url: str) -> Tuple[str, str]:
         engine, key = "Yandex", "text"
     elif "search" in path and "q" in params:
         engine, key = host, "q"
-    values = params.get(key, []) if key else []
-    query = values[0].strip() if values else ""
+    query = ""
+    if key:
+        # parse_qs replaces malformed UTF-8 percent escapes with U+FFFD.  A
+        # truncated memory string such as q=%ED%86%A0%EB must not be promoted
+        # to a genuine search for ``토�``.  Decode the selected value again
+        # with strict UTF-8 so incomplete memory fragments remain ordinary URL
+        # remnants rather than high-confidence search activity.
+        for field in parsed.query.split("&"):
+            raw_key, separator, raw_value = field.partition("=")
+            if not separator:
+                continue
+            try:
+                decoded_key = urllib.parse.unquote_plus(
+                    raw_key, encoding="utf-8", errors="strict"
+                )
+                if decoded_key != key:
+                    continue
+                query = urllib.parse.unquote_to_bytes(
+                    raw_value.replace("+", " ")
+                ).decode("utf-8", errors="strict").strip()
+            except (UnicodeDecodeError, ValueError):
+                return "", ""
+            break
     if not query or "{searchterms" in query.casefold():
         return "", ""
     return (engine, query) if query else ("", "")
+
+
+def session_recovery_is_exclusive(config) -> bool:
+    """Returns whether --recover-sessions should avoid generic memory scans."""
+
+    if not config.get("recover_sessions", False):
+        return False
+    scalar_modes = (
+        "recover_searches", "recover_closed", "navigation_candidates",
+        "navigation_structures", "memory_only", "scan_physical",
+        "physical_only", "physical_browser_context", "process_only",
+    )
+    if any(config.get(name, False) for name in scalar_modes):
+        return False
+    if str(config.get("search_terms", "")).strip():
+        return False
+    if config.get("pid") or config.get("eprocess_offsets"):
+        return False
+    return True
 
 
 def search_query_value(url: str) -> str:
@@ -780,7 +956,7 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
     """Recovers Chromium history and possible private-mode URLs."""
 
     _required_framework_version = (2, 4, 0)
-    _version = (3, 14, 0)
+    _version = (3, 16, 0)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -792,6 +968,8 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                 name="pslist", component=pslist.PsList, version=(3, 0, 0)),
             requirements.VersionRequirement(
                 name="psscan", component=psscan.PsScan, version=(2, 0, 0)),
+            requirements.VersionRequirement(
+                name="filescan", component=filescan.FileScan, version=(2, 0, 0)),
             requirements.ListRequirement(
                 name="pid", description="Browser process IDs to include",
                 element_type=int, optional=True),
@@ -873,6 +1051,13 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                 description=(
                     "Recover arbitrary URL remnants from browser VADs and full "
                     "physical memory without requiring a known URL or search term"
+                ),
+                default=False, optional=True),
+            requirements.BooleanRequirement(
+                name="recover_sessions",
+                description=(
+                    "Recover cached Chromium Sessions/Tabs files and label "
+                    "restored or session-backed navigation separately"
                 ),
                 default=False, optional=True),
             requirements.BooleanRequirement(
@@ -964,6 +1149,127 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                 ),
                 default=False, optional=True),
         ]
+
+    def _cached_file_data(self, file_obj) -> Iterator[bytes]:
+        """Reads resident DataSection/SharedCacheMap pages without writing files."""
+
+        kernel = self.context.modules[self.config["kernel"]]
+        primary_layer = self.context.layers[kernel.layer_name]
+        memory_layer = self.context.layers[primary_layer.config["memory_layer"]]
+        candidates = []
+        try:
+            control_area = (
+                file_obj.SectionObjectPointer.DataSectionObject
+                .dereference().cast("_CONTROL_AREA")
+            )
+            if control_area.is_valid():
+                candidates.append((control_area, memory_layer))
+        except exceptions.InvalidAddressException:
+            pass
+        try:
+            shared = (
+                file_obj.SectionObjectPointer.SharedCacheMap
+                .dereference().cast("_SHARED_CACHE_MAP")
+            )
+            if shared.is_valid():
+                candidates.append((shared, primary_layer))
+        except exceptions.InvalidAddressException:
+            pass
+
+        for memory_object, layer in candidates:
+            chunks = []
+            logical_size = 0
+            try:
+                pages = list(memory_object.get_available_pages())
+                for memoffset, fileoffset, datasize in pages:
+                    if fileoffset > 32 * 1024 * 1024:
+                        continue
+                    data = layer.read(memoffset, datasize, pad=True)
+                    chunks.append((fileoffset, data))
+                    logical_size = max(logical_size, fileoffset + len(data))
+            except exceptions.InvalidAddressException:
+                continue
+            if not chunks or logical_size > 32 * 1024 * 1024:
+                continue
+            result = bytearray(logical_size)
+            for fileoffset, data in chunks:
+                result[fileoffset:fileoffset + len(data)] = data
+            yield bytes(result)
+
+    def _session_records(self) -> Iterator[RecoveredURL]:
+        """Recovers URLs from resident Chromium SNSS session/tab files."""
+
+        emitted: Set[Tuple[str, str, str]] = set()
+        for file_obj in filescan.FileScan.scan_files(
+            self.context, self.config["kernel"]
+        ):
+            try:
+                name = str(file_obj.file_name_with_device())
+            except (exceptions.InvalidAddressException, ValueError):
+                continue
+            match = SESSION_FILE_RE.search(name)
+            if not match:
+                continue
+            lowered = name.casefold()
+            if "\\microsoft\\edge\\" in lowered:
+                process = "msedge.exe"
+            elif "\\opera software\\" in lowered:
+                process = "opera.exe"
+            elif "\\google\\chrome\\" in lowered:
+                process = "chrome.exe"
+            elif "\\bravesoftware\\" in lowered:
+                process = "brave.exe"
+            elif "\\vivaldi\\" in lowered:
+                process = "vivaldi.exe"
+            else:
+                process = "chromium"
+            kind = match.group("kind").title()
+            timestamp = chromium_session_time(match.group("stamp"))
+            timestamp_kst = utc_to_kst(timestamp)
+            for data in self._cached_file_data(file_obj):
+                for local_offset, url in extract_session_urls(
+                    data, self.config.get("max_url_length", 4096)
+                ):
+                    navigation = parse_serialized_navigation(data, local_offset)
+                    if navigation is None:
+                        continue
+                    url = navigation.url
+                    identity = (process, kind, normalize_url(url))
+                    if identity in emitted:
+                        continue
+                    emitted.add(identity)
+                    engine, query = search_details(url)
+                    yield RecoveredURL(
+                        source="SessionFile",
+                        confidence=(
+                            "Cached Chromium session state; may represent an "
+                            "open, closed, restored, or prior navigation entry; "
+                            f"session file time {timestamp_kst or timestamp}"
+                        ),
+                        pid=-1,
+                        process=process,
+                        offset=file_obj.vol.offset + local_offset,
+                        url=url,
+                        search_engine=engine,
+                        search_query=query,
+                        title=navigation.title,
+                        # The timestamp in the SNSS filename is the session
+                        # file generation/update time, not this URL's visit
+                        # time.  Never expose it as LastVisitUTC/KST.
+                        last_visit_time="",
+                        navigation_structure="SerializedNavigationEntry",
+                        navigation_index=navigation.index,
+                        transition_type=navigation.transition_type,
+                        activity_role=f"{kind}StateNavigation",
+                        persistence_assessment="SessionStateArtifact",
+                        browsing_mode="Unknown",
+                        mode_evidence=(
+                            "Session files do not establish regular/private mode; "
+                            f"file time {timestamp_kst or timestamp} is not a URL visit time"
+                        ),
+                        artifact_class="BrowserSessionState",
+                        canonical_activity=normalize_url(url),
+                    )
 
     def _history_records(self) -> Iterator[RecoveredURL]:
         kernel = self.context.modules[self.config["kernel"]]
@@ -1197,13 +1503,15 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                             )
                     except exceptions.InvalidAddressException:
                         continue
-                    if b"profile::primary_otr" in prefix:
-                        otr_objects.add(int(offset))
-                        original_profile = struct.unpack_from(
-                            "<Q", prefix, 0xF8
-                        )[0]
-                        if 0x10000 <= original_profile < 0x800000000000:
-                            original_profiles.add(original_profile)
+                    otr_objects.add(int(offset))
+                    original_offset = int(
+                        layout.get("otr_original_profile_offset", 0xF8)
+                    )
+                    original_profile = struct.unpack_from(
+                        "<Q", prefix, original_offset
+                    )[0]
+                    if 0x10000 <= original_profile < 0x800000000000:
+                        original_profiles.add(original_profile)
                 if not otr_objects:
                     continue
 
@@ -1255,6 +1563,250 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                 continue
         return {}
 
+    def _navigation_controller_records(
+        self,
+        processes: Sequence[object],
+        history_keys: Set[str],
+        history_scanned: bool,
+    ) -> Iterator[RecoveredURL]:
+        """Recovers GURLs owned by exact-build NavigationControllers."""
+
+        session_flags = getattr(self, "_session_private_flags", {})
+        kernel = self.context.modules[self.config["kernel"]]
+        seen: Set[Tuple[int, int, str]] = set()
+        for proc in processes:
+            try:
+                args = cmdline.CmdLine.get_cmdline(
+                    self.context, kernel.symbol_table_name, proc
+                ) or ""
+                if "--type=" in args:
+                    continue
+                process_name = utility.array_to_string(proc.ImageFileName)
+                module_name, module_base = ChromiumHistory._find_browser_module(
+                    self, proc, process_name
+                )
+                if not module_base:
+                    continue
+                explicit_rva = int(self.config.get("private_flag_rva", 0))
+                family_key = (process_name.casefold(), module_name)
+                flag_data = session_flags.get(family_key)
+                effective_rva = explicit_rva or (
+                    int(flag_data[0]) if flag_data else 0
+                )
+                if not effective_rva:
+                    continue
+                layout = PRIVATE_CONTEXT_OBJECT_BUILDS.get(effective_rva)
+                required_keys = (
+                    "navigation_controller_vftable_rva",
+                    "navigation_entry_vftable_rva",
+                    "navigation_controller_context_offset",
+                    "navigation_controller_entries_offset",
+                    "navigation_entry_virtual_url_offset",
+                    "navigation_entry_frame_tree_offset",
+                    "tree_node_frame_entry_offset",
+                    "frame_navigation_url_offset",
+                )
+                if not layout or not all(key in layout for key in required_keys):
+                    continue
+                layer = self.context.layers[proc.add_process_layer()]
+                sections = self._vad_sections(proc, private_only=True)
+                if not sections:
+                    continue
+
+                otr_va = module_base + int(layout["otr_profile_vftable_rva"])
+                otr_objects: Set[int] = set()
+                original_profiles: Set[int] = set()
+                for offset in layer.scan(
+                    self.context,
+                    scanners.BytesScanner(struct.pack("<Q", otr_va)),
+                    sections=sections,
+                    progress_callback=self._progress_callback,
+                ):
+                    try:
+                        prefix = layer.read(int(offset), 0x100, pad=False)
+                    except exceptions.InvalidAddressException:
+                        continue
+                    otr_objects.add(int(offset))
+                    original_offset = int(
+                        layout.get("otr_original_profile_offset", 0xF8)
+                    )
+                    original_profile = struct.unpack_from(
+                        "<Q", prefix, original_offset
+                    )[0]
+                    if 0x10000 <= original_profile < 0x800000000000:
+                        original_profiles.add(original_profile)
+                if not otr_objects:
+                    vollog.debug(
+                        "PID %d: no exact-build OTR profile objects",
+                        int(proc.UniqueProcessId),
+                    )
+                    continue
+
+                vollog.debug(
+                    "PID %d: recovered %d OTR profile object(s)",
+                    int(proc.UniqueProcessId), len(otr_objects),
+                )
+
+                controller_va = module_base + int(
+                    layout["navigation_controller_vftable_rva"]
+                )
+                entry_va = module_base + int(
+                    layout["navigation_entry_vftable_rva"]
+                )
+                context_offset = int(
+                    layout["navigation_controller_context_offset"]
+                )
+                entries_offset = int(
+                    layout["navigation_controller_entries_offset"]
+                )
+                url_offset = int(layout["navigation_entry_virtual_url_offset"])
+                controller_matches = 0
+                for controller_offset in layer.scan(
+                    self.context,
+                    scanners.BytesScanner(struct.pack("<Q", controller_va)),
+                    sections=sections,
+                    progress_callback=self._progress_callback,
+                ):
+                    controller_matches += 1
+                    try:
+                        data = layer.read(int(controller_offset), 0x30, pad=False)
+                        browser_context = struct.unpack_from(
+                            "<Q", data, context_offset
+                        )[0]
+                        begin, end, capacity = struct.unpack_from(
+                            "<QQQ", data, entries_offset
+                        )
+                    except (exceptions.InvalidAddressException, struct.error):
+                        continue
+                    browsing_mode = self._classify_browser_context(
+                        browser_context, otr_objects, original_profiles
+                    )
+                    vollog.debug(
+                        "PID %d controller=%#x context=%#x mode=%s "
+                        "entries=%#x-%#x capacity=%#x",
+                        int(proc.UniqueProcessId), int(controller_offset),
+                        browser_context, browsing_mode, begin, end, capacity,
+                    )
+                    if browsing_mode == "Unknown":
+                        continue
+                    # Chromium's hardened libc++ ABI stores some vectors as
+                    # {data pointer, size, capacity}; older builds use the
+                    # conventional {begin, end, end_cap} layout.  Accept only
+                    # a bounded, internally consistent instance of either.
+                    if (end <= 512 and capacity <= 512 and end <= capacity):
+                        count = int(end)
+                    elif (begin <= end <= capacity and (end - begin) % 8 == 0
+                          and end - begin <= 4096):
+                        count = (end - begin) // 8
+                    else:
+                        continue
+                    if begin < 0x10000 or count == 0:
+                        continue
+                    for index in range(count):
+                        try:
+                            entry_object = struct.unpack(
+                                "<Q", layer.read(begin + index * 8, 8, pad=False)
+                            )[0]
+                            if not (0x10000 <= entry_object < 0x800000000000):
+                                continue
+                            vftable = struct.unpack(
+                                "<Q", layer.read(entry_object, 8, pad=False)
+                            )[0]
+                            if vftable != entry_va:
+                                continue
+                            url = decode_libcpp_string(
+                                layer, entry_object + url_offset,
+                                int(self.config.get("max_url_length", 4096)),
+                            )
+                            url_address = entry_object + url_offset
+                            # virtual_url_ is intentionally empty for many
+                            # committed entries.  Follow the owning TreeNode
+                            # to FrameNavigationEntry::url_ instead.
+                            if not is_recoverable_url(url):
+                                tree_offset = int(
+                                    layout["navigation_entry_frame_tree_offset"]
+                                )
+                                node_entry_offset = int(
+                                    layout["tree_node_frame_entry_offset"]
+                                )
+                                frame_url_offset = int(
+                                    layout["frame_navigation_url_offset"]
+                                )
+                                frame_tree = struct.unpack(
+                                    "<Q", layer.read(
+                                        entry_object + tree_offset, 8, pad=False
+                                    )
+                                )[0]
+                                frame_entry = struct.unpack(
+                                    "<Q", layer.read(
+                                        frame_tree + node_entry_offset, 8,
+                                        pad=False,
+                                    )
+                                )[0]
+                                url_address = frame_entry + frame_url_offset
+                                url = decode_libcpp_string(
+                                    layer, url_address,
+                                    int(self.config.get("max_url_length", 4096)),
+                                )
+                        except (exceptions.InvalidAddressException, struct.error):
+                            continue
+                        if not is_recoverable_url(url):
+                            continue
+                        identity = (int(controller_offset), index, normalize_url(url))
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                        engine, query = search_details(url)
+                        artifact_class, canonical_activity = classify_artifact(
+                            url, "NavigationEntry", "ConfirmedNavigationStructure"
+                        )
+                        if (not self.config.get("raw_url_strings", False)
+                                and artifact_class in (
+                                    "TemplateOrInternal",
+                                    "BackgroundOrEmbedded",
+                                )):
+                            continue
+                        yield RecoveredURL(
+                            source="NavigationEntry",
+                            confidence=(
+                                "PDB-validated NavigationControllerImpl entries_ "
+                                "and NavigationEntryImpl virtual_url_"
+                            ),
+                            pid=int(proc.UniqueProcessId),
+                            process=process_name,
+                            offset=url_address,
+                            url=url,
+                            search_engine=engine,
+                            search_query=query,
+                            candidate_score=200,
+                            candidate_reasons=(
+                                "navigation-controller;navigation-entry;"
+                                "browser-context-identity"
+                            ),
+                            navigation_structure="NavigationEntryImpl",
+                            navigation_index=index,
+                            activity_role="ConfirmedNavigationStructure",
+                            persistence_assessment=persistence_assessment(
+                                url, history_keys, history_scanned
+                            ),
+                            browsing_mode=browsing_mode,
+                            mode_evidence=(
+                                f"NavigationControllerImpl {int(controller_offset):#x} "
+                                f"owns BrowserContext {browser_context:#x}; "
+                                f"OTR objects="
+                                + ",".join(f"{value:#x}" for value in otr_objects)
+                            ),
+                            artifact_class=artifact_class,
+                            canonical_activity=canonical_activity,
+                        )
+                vollog.debug(
+                    "PID %d: scanned %d NavigationControllerImpl candidate(s)",
+                    int(proc.UniqueProcessId), controller_matches,
+                )
+            except (exceptions.InvalidAddressException, AttributeError,
+                    TypeError, struct.error):
+                continue
+
     @staticmethod
     def _classify_browser_context(
         browser_context: int,
@@ -1290,7 +1842,7 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
             proc, process_name
         )
         return modes.get(
-            (module_name, client_id),
+            (process_name.casefold(), module_name, client_id),
             ("Unknown", f"Renderer client {client_id} not recovered in browser host")
         )
 
@@ -1359,7 +1911,8 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                 # so reuse a build identity recovered from a sibling process.
                 if not flag_rva:
                     session_flags = getattr(self, "_session_private_flags", {})
-                    session_value = session_flags.get(module_name)
+                    family_key = (process_name.casefold(), module_name)
+                    session_value = session_flags.get(family_key)
                     if session_value:
                         flag_rva = int(session_value[0])
                         resolution = str(session_value[1])
@@ -1467,7 +2020,9 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
         # never be reused for Chrome (or another Chromium browser) merely
         # because both families coexist in the same capture.
         if not int(self.config.get("private_flag_rva", 0)):
-            self._session_private_flags: Dict[str, Tuple[int, str]] = {}
+            self._session_private_flags: Dict[
+                Tuple[str, str], Tuple[int, str]
+            ] = {}
             for candidate in processes:
                 try:
                     process_name = utility.array_to_string(
@@ -1478,7 +2033,8 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                     )
                     if not candidate_base:
                         continue
-                    if module_name in self._session_private_flags:
+                    family_key = (process_name.casefold(), module_name)
+                    if family_key in self._session_private_flags:
                         continue
                     candidate_layer = self.context.layers[
                         candidate.add_process_layer()
@@ -1489,7 +2045,7 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                         )
                     )
                     if resolved_rva:
-                        self._session_private_flags[module_name] = (
+                        self._session_private_flags[family_key] = (
                             resolved_rva,
                             resolved_evidence
                             + f"; reused across {module_name} session",
@@ -1499,29 +2055,54 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
 
         context_mode_reader = getattr(self, "_renderer_context_modes", None)
         self._renderer_client_modes: Dict[
-            Tuple[str, int], Tuple[str, str]
+            Tuple[str, str, int], Tuple[str, str]
         ] = {}
         explicit_rva = int(self.config.get("private_flag_rva", 0))
         session_flags = getattr(self, "_session_private_flags", {})
         if callable(context_mode_reader):
-            module_groups: Dict[str, List[object]] = {}
+            module_groups: Dict[Tuple[str, str], List[object]] = {}
             for candidate in processes:
                 process_name = utility.array_to_string(candidate.ImageFileName)
                 module_name, _base = ChromiumHistory._find_browser_module(
                     self, candidate, process_name
                 )
-                module_groups.setdefault(module_name, []).append(candidate)
-            for module_name, grouped_processes in module_groups.items():
+                family_key = (process_name.casefold(), module_name)
+                module_groups.setdefault(family_key, []).append(candidate)
+            for family_key, grouped_processes in module_groups.items():
+                process_family, module_name = family_key
                 effective_rva = explicit_rva
-                if not effective_rva and module_name in session_flags:
-                    effective_rva = int(session_flags[module_name][0])
+                if not effective_rva and family_key in session_flags:
+                    effective_rva = int(session_flags[family_key][0])
                 if not effective_rva:
                     continue
                 recovered = context_mode_reader(
                     grouped_processes, effective_rva, module_name
                 )
                 for client_id, value in recovered.items():
-                    self._renderer_client_modes[(module_name, client_id)] = value
+                    self._renderer_client_modes[
+                        (process_family, module_name, client_id)
+                    ] = value
+
+        navigation_reader = getattr(
+            self, "_navigation_controller_records", None
+        )
+        navigation_records = (
+            navigation_reader(processes, history_keys, history_scanned)
+            if callable(navigation_reader) else ()
+        )
+        for record in navigation_records:
+            identity_pid = (
+                record.pid if self.config.get("raw_url_strings", False) else 0
+            )
+            normalized = record.canonical_activity or normalize_url(record.url)
+            identity = (identity_pid, normalized)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            yield record
+            emitted += 1
+            if emitted >= maximum:
+                return
 
         for proc in processes:
             pid = int(proc.UniqueProcessId)
@@ -1875,7 +2456,10 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
         history_scanned = (
             not self.config.get("skip_history", False)
             and (self.config.get("compare_history", False)
-                 or not (targeted_search or recover_searches or recover_closed))
+                 or not (
+                     targeted_search or recover_searches or recover_closed
+                     or self.config.get("recover_sessions", False)
+                 ))
         )
         if history_scanned:
             for record in self._history_records():
@@ -1904,16 +2488,44 @@ class ChromiumHistory(interfaces.plugins.PluginInterface):
                 yield self._output_row(record)
         if self.config.get("history_only", False):
             return
-        process_count = 0
-        if not self.config.get("physical_only", False):
-            for record in self._memory_records(set(history), history_scanned):
-                process_count += 1
+        focused_session_recovery = session_recovery_is_exclusive(self.config)
+        if self.config.get("recover_sessions", False):
+            for record in self._session_records():
+                if search_terms and not matches_search_terms(
+                    record.url, search_terms
+                ):
+                    continue
+                if url_filters and not any(
+                    item in record.url.casefold() for item in url_filters
+                ):
+                    continue
                 identity = recovered_activity_identity(record)
                 if not raw_output and identity in reported_activities:
                     continue
                 if not raw_output:
                     reported_activities.add(identity)
                 yield self._output_row(record)
+        process_count = 0
+        if not self.config.get("physical_only", False):
+            for record in self._memory_records(set(history), history_scanned):
+                process_count += 1
+                # A focused session run also preserves URLs owned by a
+                # structurally proven private renderer.  Unknown/Regular VAD
+                # strings remain suppressed so the old hundreds-of-candidates
+                # noise does not return.
+                if (focused_session_recovery
+                        and record.browsing_mode != "InPrivate"):
+                    continue
+                identity = recovered_activity_identity(record)
+                if not raw_output and identity in reported_activities:
+                    continue
+                if not raw_output:
+                    reported_activities.add(identity)
+                yield self._output_row(record)
+        if focused_session_recovery:
+            # Physical strings have no owning renderer/BrowserContext and
+            # therefore cannot meet the structural InPrivate requirement.
+            return
         use_fallback = (
             self.config.get("physical_fallback", True) and process_count == 0
         )

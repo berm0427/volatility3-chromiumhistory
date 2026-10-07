@@ -1,5 +1,19 @@
 # ChromiumHistory v1.13.0
 
+## 출처 및 프로젝트 관계
+
+이 저장소는 2024년 팀 활동에서 작성된
+[`forsick/Windows`의 `feat/v2` 브랜치](https://github.com/forsick/Windows/tree/feat/v2)를
+출발점으로 삼아 개인 연구 목적으로 대폭 재작성하고 확장한 결과물입니다. 원본의
+Chromium History 분석 아이디어와 초기 플러그인 구현에 대한 공로는 원 프로젝트와
+참여자들에게 있습니다.
+
+현재 구현은 Volatility 3 등록 방식, 독립 SQLite 레코드 해석, 프로세스·물리 메모리
+URL 카빙, 세션 복구, Chromium private-mode 구조 판별, 결과 정규화 및 테스트를
+새로 구성했습니다. 구체적인 출처와 권리 관련 주의사항은 [NOTICE.md](NOTICE.md)를
+참조하십시오. 이 저장소는 대회 출품용 독립 창작물로 주장하지 않으며 개인 연구와
+포트폴리오 기록을 목적으로 공개합니다.
+
 Windows 메모리 덤프에서 Chromium 계열 브라우저의 일반 방문 기록과
 프로세스 메모리에 남은 URL 흔적을 복구하는 Volatility 3 플러그인입니다.
 Microsoft Edge의 InPrivate 환경을 중심으로 실제 메모리 덤프를 이용해
@@ -104,6 +118,39 @@ python .\vol.py -f .\memory.raw `
   windows.chromiumhistory.ChromiumHistory --recover-closed
 ```
 
+메모리에 캐시된 Chromium `Sessions\Tabs_*` 및 `Sessions\Session_*` 파일에서
+구조적으로 검증된 탐색 항목을 복구:
+
+```powershell
+python .\vol.py -f .\memory.raw `
+  windows.chromiumhistory.ChromiumHistory --recover-sessions
+```
+
+이 모드는 전체 파일 객체를 스캔하므로 일반 실행보다 오래 걸릴 수 있습니다.
+결과는 `Source=SessionFile`로 표시되며 `ActivityRole`은
+`TabsStateNavigation` 또는 `SessionStateNavigation`입니다. 파일명에 들어 있는
+Chromium 시각은 개별 URL의 방문 시각이 아니라 해당 세션 파일의 생성·갱신
+시각이므로 `LastVisitKST`에 표시하지 않습니다. 참고용 파일 시각은 상세 출력의
+`Confidence`와 `ModeEvidence`에 별도로 표시됩니다.
+
+`Tabs_*`에는 한 탭의 이전/다음 탐색 스택과 복원된 과거 탭도 포함될 수 있습니다.
+따라서 `SessionFile` 한 행을 곧바로 "덤프 순간 열려 있던 탭"이라고 단정하면 안
+됩니다. 대신 단순 URL 문자열과 달리 `NavigationStructure=SerializedNavigationEntry`,
+탐색 인덱스, 제목 및 전환 형식이 함께 제공되므로 복원 세션과 현재 활동을 구분하는
+강한 보조 증거로 사용할 수 있습니다.
+
+`--recover-sessions`를 단독으로 사용하면 신뢰도가 더 높은 세션 구조와 정확한
+빌드 구조로 확인된 `InPrivate` 렌더러 결과만 출력하고, `Unknown` 및 일반
+프로세스 URL 문자열은 섞지 않습니다. 더 넓은 메모리 후보까지 비교하려면
+`--recover-sessions --recover-closed`처럼 명시적인 메모리 복구 옵션을 함께
+지정합니다. 메모리에서 끝부분이 잘린 UTF-8 퍼센트 인코딩은 정상 검색어로
+승격하지 않습니다.
+
+Windows PowerShell에서 한글과 특수문자가 포함된 CSV를 저장할 때는 Python의
+UTF-8 출력과 콘솔 인코딩을 함께 맞추거나 `cmd.exe`의 바이트 리디렉션을
+사용하십시오. PowerShell이 UTF-8 출력을 CP949로 중간 변환하면 원본 결과가
+손상될 수 있습니다.
+
 HistoryDB와 비교하여 영속 기록 여부까지 판정:
 
 ```powershell
@@ -131,6 +178,17 @@ python .\vol.py -f .\memory.raw `
 지원되는 빌드에서 가장 신뢰할 수 있습니다. 알 수 없는 빌드는 임의로
 `InPrivate`라고 추정하지 않고 `Unknown`으로 남깁니다.
 
+여기서 `Unknown`은 URL 복구 실패를 뜻하지 않습니다. 특히 닫힌 시크릿 탭은 OTR
+객체가 파괴된 뒤 URL 문자열만 남을 수 있으며, 이 경우에도 URL 복구 자체는
+성공입니다. 출력의 모드와 근거 필드는 URL 복구 성공 여부와 별개로, 그 URL을
+시크릿 프로필에 구조적으로 귀속시킬 수 있는지를 나타냅니다.
+
+Chrome 154.0.8037.98과 Brave 1.96.61에서는 PDB 및 실덤프로 확인한
+`OffTheRecordProfile → NavigationControllerImpl → NavigationEntryImpl → GURL`
+소유관계를 추가로 검증합니다. 이 경로는 URL이나 검색어를 미리 알 필요가 없으며,
+열려 있는 일반 탭과 시크릿 탭을 구조적으로 구분합니다. 닫힌 탭은 객체가 이미
+파괴되었을 수 있으므로, 남은 URL 문자열만으로 시크릿 방문이라고 확정하지 않습니다.
+
 ## 테스트
 
 ```powershell
@@ -138,8 +196,9 @@ python .\tests\test_chromiumhistory.py
 python .\tests\test_mock_integration.py
 ```
 
-현재 버전은 단위 및 모의 통합 테스트 39개를 통과했으며, 35.9GB Windows 메모리
-덤프에서 일반 HistoryDB 레코드와 Edge InPrivate 활동을 검증했습니다. 저장소의
+현재 버전은 단위 및 모의 통합 테스트 49개를 통과했으며, 35.9GB Windows 메모리
+덤프에서 일반 HistoryDB 레코드와 Chrome·Brave의 구조 기반 private 활동을
+검증했습니다. 저장소의
 `media/ChromiumHistory-v1.12.0-validation.mp4`에서 실제 실행 화면을 확인할 수
 있습니다.
 

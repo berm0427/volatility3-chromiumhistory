@@ -121,6 +121,123 @@ class ChromiumHistoryTests(unittest.TestCase):
         data = (expected + "\x00ignored").encode("utf-16le")
         self.assertEqual(chromiumhistory.extract_memory_url(data, True), expected)
 
+    def test_session_filename_timestamp(self):
+        self.assertEqual(
+            chromiumhistory.chromium_session_time("13435761833973378"),
+            "2026-10-06T12:03:53.973378+00:00",
+        )
+
+    def test_session_url_recovery_deduplicates(self):
+        data = (
+            b"SNSS\x00https://example.test/open\x00"
+            b"https://example.test/open\x00"
+            b"https://example.test/closed?q=one\x00"
+        )
+        self.assertEqual(
+            [url for _offset, url in chromiumhistory.extract_session_urls(data)],
+            [
+                "https://example.test/open",
+                "https://example.test/closed?q=one",
+            ],
+        )
+
+    def test_truncated_utf8_search_query_is_not_promoted(self):
+        self.assertEqual(
+            chromiumhistory.search_details(
+                "https://www.google.com/search?q=%ED%86%A0%EB"
+            ),
+            ("", ""),
+        )
+        self.assertEqual(
+            chromiumhistory.search_details(
+                "https://www.google.com/search?q=gpt+%EB%"
+            ),
+            ("", ""),
+        )
+
+    def test_complete_utf8_search_query_is_preserved(self):
+        self.assertEqual(
+            chromiumhistory.search_details(
+                "https://www.google.com/search?q=%ED%86%A0%EB%A0%8C%ED%8A%B8"
+            ),
+            ("Google", "토렌트"),
+        )
+
+    def test_recover_sessions_is_focused_by_default(self):
+        self.assertTrue(chromiumhistory.session_recovery_is_exclusive({
+            "recover_sessions": True,
+        }))
+        self.assertFalse(chromiumhistory.session_recovery_is_exclusive({
+            "recover_sessions": True,
+            "recover_closed": True,
+        }))
+        self.assertFalse(chromiumhistory.session_recovery_is_exclusive({
+            "recover_sessions": True,
+            "search_terms": "known-value",
+        }))
+
+    def test_edge_154_53_three_structure_mapping(self):
+        self.assertEqual(
+            chromiumhistory.PRIVATE_FLAG_BUILDS[
+                (0x6ABD9861, 0x14F3B000)
+            ][0],
+            0x13E6B6CC,
+        )
+        layout = chromiumhistory.PRIVATE_CONTEXT_OBJECT_BUILDS[0x13E6B6CC]
+        self.assertEqual(layout["otr_profile_vftable_rva"], 0x112A73A8)
+        self.assertEqual(layout["render_host_vftable_rvas"], (0x112B3760,))
+        self.assertEqual(layout["render_host_client_id_offset"], 0x1B0)
+        self.assertEqual(layout["render_host_browser_context_offset"], 0x1B8)
+
+    def test_chrome_154_98_three_structure_mapping(self):
+        self.assertEqual(
+            chromiumhistory.PRIVATE_FLAG_BUILDS[
+                (0x6ABD899F, 0x12320000)
+            ],
+            (0x117AAEF8, "Google Chrome 154.0.8037.98"),
+        )
+        layout = chromiumhistory.PRIVATE_CONTEXT_OBJECT_BUILDS[0x117AAEF8]
+        self.assertEqual(layout["otr_profile_vftable_rva"], 0xF8FE0C8)
+        self.assertIn(0xF948948, layout["render_host_vftable_rvas"])
+        self.assertEqual(layout["render_host_client_id_offset"], 0x1B0)
+        self.assertEqual(layout["render_host_browser_context_offset"], 0x1B8)
+        self.assertEqual(layout["navigation_entry_virtual_url_offset"], 0x28)
+        self.assertEqual(layout["frame_navigation_url_offset"], 0x60)
+
+    def test_libcpp_alternate_long_string_layout(self):
+        url = b"https://example.test/navigation"
+        memory = {
+            0x1000: struct.pack("<QQQ", 0x20000, len(url), len(url) | (1 << 63)),
+            0x20000: url,
+        }
+
+        class Layer:
+            def read(self, address, length, pad=False):
+                for base, value in memory.items():
+                    if base <= address and address + length <= base + len(value):
+                        start = address - base
+                        return value[start:start + length]
+                raise ValueError(address)
+
+        self.assertEqual(
+            chromiumhistory.decode_libcpp_string(Layer(), 0x1000),
+            url.decode("ascii"),
+        )
+
+    def test_brave_196_61_three_structure_mapping(self):
+        self.assertEqual(
+            chromiumhistory.PRIVATE_FLAG_BUILDS[
+                (0x6ABF8DA1, 0x13AE2000)
+            ],
+            (0x12F00E20, "Brave 1.96.61 (Chromium 154)"),
+        )
+        layout = chromiumhistory.PRIVATE_CONTEXT_OBJECT_BUILDS[0x12F00E20]
+        self.assertEqual(layout["otr_profile_vftable_rva"], 0x10C8BB48)
+        self.assertIn(0x10D15450, layout["render_host_vftable_rvas"])
+        self.assertEqual(layout["render_host_client_id_offset"], 0x1B0)
+        self.assertEqual(layout["render_host_browser_context_offset"], 0x1B8)
+        self.assertEqual(layout["navigation_entry_virtual_url_offset"], 0x1D0)
+
     def test_trailing_punctuation_is_removed(self):
         data = b"https://example.net/test).\x00"
         self.assertEqual(
