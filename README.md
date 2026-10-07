@@ -33,7 +33,7 @@ Microsoft Edge의 InPrivate 환경을 중심으로 실제 메모리 덤프를 �
 - 탭을 닫은 뒤에도 관련 메모리 페이지와 렌더러가 남아 있으면 흔적 복구 가능
 - Google이나 Bing 같은 특정 검색 엔진 및 특정 검색어에 의존하지 않는 범용 탐색
 - 동일 활동의 메모리 복제본을 정규화하여 기본 출력에서 중복 억제
-- Chrome, Edge, Brave, Opera, Vivaldi, Chromium 및 이름이 다른 Chromium 기반
+- Chrome, Edge, Brave, Opera, Vivaldi 등의 이름이 다른 Chromium 기반
   브라우저를 모듈 흔적으로 탐지
 - 전체 물리 메모리 카빙과 HistoryDB 비교 기능 제공
 
